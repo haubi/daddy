@@ -1,0 +1,206 @@
+#! /usr/bin/env bash
+#
+# The MIT License (MIT)
+# 
+# Copyright (c) 2015 Michael Haubenwallner
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# 
+
+varlibdir="/var/lib/daddy"
+id_root="root"
+checkinterval=3
+
+user=
+daylimit=
+weeklimit=
+monthlimit=
+
+doinstall=
+douninstall=
+doconfine=
+doobserve=
+doreport=
+
+usage() {
+  echo "$0 --user=<user> [--{day|week|month}-limit=<minutes>]"
+}
+
+while [[ $1 ]]
+do
+  arg=$1
+  shift
+  case ${arg} in
+  --debug) PS4='($LINENO)+ '; set -xv ;;
+  --user=*) user=${arg#--user=} ;;
+  --day-limit=*) daylimit=${arg#--day-limit=} ;;
+  --week-limit=*) weeklimit=${arg#--week-limit=} ;;
+  --month-limit=*) monthlimit=${arg#--month-limit=} ;;
+  --install) douninstall='--uninstall'; doinstall=${arg} ;;
+  --uninstall) douninstall=${arg} ;;
+  --confine) doconfine=${arg} ;;
+  --observe) doobserve=${arg} ;;
+  --report) doreport=${arg} ;;
+  --run) ;;
+  esac
+done
+
+if [[ -z $user ]]
+then
+  usage >&2
+  exit 1
+fi
+
+id_un=$(id -un ${user} 2>/dev/null)
+if [[ $? != 0 || -z ${id_un} || ${id_un} == ${id_root} ]]
+then
+  usage >&2
+  echo "invalid user '${user}'" >&2
+  exit 1
+fi
+
+user=${id_un}
+userdir=${varlibdir}/${user}
+
+umask 077
+if ! mkdir -p "${userdir}"
+then
+  echo "cannot create directory ${userdir}" >&2
+  exit 1
+fi
+
+if [[ ${douninstall} ]]
+then
+  if [[ -s "${userdir}"/job ]]
+  then
+    while read job jobno time
+    do [[ ${job} == 'job' ]] && break
+    done < "${userdir}"/job
+    jobspec=$(at -c ${jobno} 2>/dev/null)
+    if [[ ${jobspec} == *"--user=${user}"* ]]
+    then
+      at -d ${jobno} 2>/dev/null
+    fi
+  fi
+fi
+
+if [[ ${doinstall} ]]
+then
+  at now + ${checkinterval} minutes 2> "${userdir}"/job <<EOF
+    $0 '--user=${user}' --day-limit=${daylimit} --week-limit=${weeklimit} --month-limit=${monthlimit} --install --observe --report ${doconfine}
+EOF
+fi
+
+eval $(date '+nowday=%Y-%m-%d;nowweek=%Gw%V;nowmonth=%Y-%m;')
+
+dayfile=${userdir}/${nowday}
+weekfile=${userdir}/${nowweek}
+monthfile=${userdir}/${nowmonth}
+
+isactive=unknown
+islocked=unknown
+if [[ ${doobserve} || ${doreport} || ${doconfine} ]]
+then
+  isactive=false
+  procs=$(ps --no-header -f -u ${user} 2>/dev/null)
+  if [[ $? -eq 0 && ${#procs} -gt 0 ]]
+  then
+    isactive=:
+  fi
+
+  islocked=false
+  if grep -q "${user}:"'!' /etc/shadow
+  then
+    islocked=true
+  fi
+fi
+
+if [[ ${doreport} || ${doconfine} ]]
+then
+  daytime=0
+  weektime=0
+  monthtime=0
+  if [[ -s ${dayfile} && -n ${daylimit} ]]
+  then
+    read daytime < "${dayfile}"
+    daytime=${#daytime}
+  fi
+  if [[ -s ${weekfile} && -n ${weeklimit} ]]
+  then
+    read weektime < "${weekfile}"
+    weektime=${#weektime}
+  fi
+  if [[ -s ${monthfile} && -n ${monthlimit} ]]
+  then
+    read monthtime < "${monthfile}"
+    monthtime=${#monthtime}
+  fi
+  : ${daylimit:=0}
+  : ${weeklimit:=0}
+  : ${monthlimit:=0}
+  dayrest=$(( daylimit - (daytime * checkinterval) ))
+  weekrest=$(( weeklimit - (weektime * checkinterval) ))
+  monthrest=$(( monthlimit - (monthtime * checkinterval) ))
+fi
+
+if ${isactive} && [[ ${doreport} ]]
+then
+  eval "reportfile=~${user}/.daddy-limit"
+  printf 'today: %5d minutes\n week: %5d minutes\nmonth: %5d minutes\n' \
+    ${dayrest} ${weekrest} ${monthrest} > "${reportfile}"
+  chmod 400 "${reportfile}"
+  chown ${user} "${reportfile}"
+fi
+
+if [[ ${doconfine} ]]
+then
+  if (( dayrest < 0 )) ||
+     (( weekrest < 0 )) ||
+     (( monthrest < 0 ))
+  then
+    if ${isactive}
+    then
+      if ${islocked}
+      then
+	killall -9 -u "${user}"
+	logger -t daddy "killall -9 -u ${user}: $?"
+      else
+	killall -u "${user}"
+	logger -t daddy "killall -u ${user}: $?"
+	isactive=false
+	usermod -L "${user}"
+	logger -t daddy "usermod -L ${user}: $?"
+	islocked=true
+      fi
+    fi
+  elif ${islocked}
+  then
+    usermod -U "${user}"
+    logger -t daddy "usermod -U ${user}: $?"
+    islocked=false
+  fi
+fi
+
+if $isactive && [[ ${doobserve} ]]
+then
+  printf '.' >> "${dayfile}"
+  printf '.' >> "${weekfile}"
+  printf '.' >> "${monthfile}"
+  logger -t daddy "${user} is active"
+fi
